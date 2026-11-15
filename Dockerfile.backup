@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+WORKDIR /srv
+COPY requirements.txt .
+RUN python -m pip install --index-url https://pypi.org/simple --no-cache-dir --retries 2 --timeout 60 -r requirements.txt && useradd -m -u 10001 app
+COPY app ./app
+RUN mkdir -p /srv/data /srv/artifacts && chown -R app:app /srv
+USER app
+EXPOSE 7005
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","7005","--workers","1"]

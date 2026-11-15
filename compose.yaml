@@ -1,0 +1,34 @@
+services:
+  aws-bank:
+    build: .
+    container_name: aws-bank-app
+    ports:
+      - "127.0.0.1:7005:7005"
+    environment:
+      AWS_BANK_DATA_DIR: /srv/data
+      AWS_BANK_ARTIFACT_DIR: /srv/artifacts
+      AWS_BANK_BOOTSTRAP_ADMIN: ${AWS_BANK_BOOTSTRAP_ADMIN:-admin}
+      AWS_BANK_BOOTSTRAP_PASSWORD: ${AWS_BANK_BOOTSTRAP_PASSWORD:?Set bootstrap password in .env}
+      AWS_BANK_SESSION_SECRET: ${AWS_BANK_SESSION_SECRET:?Set session secret in .env}
+      AWS_BANK_ENABLE_MLFLOW: ${AWS_BANK_ENABLE_MLFLOW:-false}
+    volumes:
+      - ./data:/srv/data
+      - ./artifacts:/srv/artifacts
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7005/api/health', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 15s
+    restart: unless-stopped
