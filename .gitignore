@@ -1,0 +1,44 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+data/*
+!data/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Development and execution logs
+enterprise_banking_ai_logs/
+enterprise_enhancement_logs/
+ui_modernization_logs/
+*.log
+
+# Local dependencies and caches
+wheels/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets and credentials
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/

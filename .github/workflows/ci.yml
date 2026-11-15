@@ -1,0 +1,27 @@
+name: AWS_BANK checks
+on: [push, pull_request]
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt -r requirements-test.txt
+      - run: python -m compileall -q app
+      - name: Run bounded source security scan
+        run: pwsh -NoProfile -File scripts/security_scan.ps1
+      - run: python -m pip check
+      - run: python -m pytest -q tests/test_banking.py
+      - run: pytest -q tests
+      - name: Validate scoped Compose contract
+        env:
+          AWS_BANK_BOOTSTRAP_PASSWORD: ci-only-placeholder-password
+          AWS_BANK_SESSION_SECRET: ci-only-placeholder-session-secret
+        run: docker compose -p aws_bank config --quiet
+      - name: Build scoped offline image
+        env:
+          AWS_BANK_BOOTSTRAP_PASSWORD: ci-only-placeholder-password
+          AWS_BANK_SESSION_SECRET: ci-only-placeholder-session-secret
+        run: docker compose -p aws_bank build aws-bank
