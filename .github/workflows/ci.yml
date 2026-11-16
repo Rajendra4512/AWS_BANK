@@ -10,6 +10,12 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install -r requirements.txt -r requirements-test.txt
       - run: python -m compileall -q app
+      - name: Install security scan dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
       - name: Run bounded source security scan
         run: pwsh -NoProfile -File scripts/security_scan.ps1
       - run: python -m pip check
