@@ -20,7 +20,7 @@ jobs:
         run: pwsh -NoProfile -File scripts/security_scan.ps1
       - run: python -m pip check
       - run: python -m pytest -q tests/test_banking.py
-      - run: pytest -q tests
+      - run: python -m pytest -q tests
       - name: Validate scoped Compose contract
         env:
           AWS_BANK_BOOTSTRAP_PASSWORD: ci-only-placeholder-password
