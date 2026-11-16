@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: aws-bank-development
@@ -36,6 +35,9 @@ jobs:
 
   deploy:
     needs: validate
+    permissions:
+      contents: read
+      id-token: write
     if: ${{ inputs.confirm_deployment == true && vars.AWS_BANK_DEPLOYMENT_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     environment: development
