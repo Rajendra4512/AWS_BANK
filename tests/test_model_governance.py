@@ -1,7 +1,13 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, recall_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from fastapi.testclient import TestClient
 
 from app.artifacts import ArtifactStore
@@ -56,6 +62,29 @@ def seed_evaluation(main, version, *, passed=True, model_version=None, timestamp
 def audit_actions(main):
     with main.db() as connection:
         return [row["action"] for row in connection.execute("SELECT action FROM audit ORDER BY id")]
+
+
+def test_synthetic_generator_is_deterministic_and_meets_holdout_gate(app_context):
+    main, _ = app_context
+    X, y = main.synthetic(seed=42, n=2000)
+    X_again, y_again = main.synthetic(seed=42, n=2000)
+    assert np.array_equal(X, X_again)
+    assert np.array_equal(y, y_again)
+    assert 0.02 < float(y.mean()) < 0.06
+
+    train_x, _, train_y, _ = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
+    model = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(max_iter=250, class_weight="balanced", random_state=42),
+    )
+    model.fit(train_x, train_y)
+    eval_x, eval_y = main.synthetic(seed=4242, n=600)
+    predictions = (model.predict_proba(eval_x)[:, 1] >= 0.5).astype(int)
+    tn, fp, _, _ = confusion_matrix(eval_y, predictions, labels=[0, 1]).ravel()
+    assert recall_score(eval_y, predictions, zero_division=0) >= 0.5
+    assert fp / max(fp + tn, 1) <= 0.5
 
 
 def test_candidate_without_evaluation_is_denied_and_active_is_preserved(app_context):

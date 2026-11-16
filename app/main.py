@@ -217,12 +217,16 @@ def edit_lesson(slug:str,x:LessonEdit,u=Depends(admin)):
  audit(u['username'],'lesson.update',{'slug':slug});return {'ok':True}
 
 def synthetic(seed=42,shift=0.0,n=2000):
+ # Synthetic fraud labels use a learnable, imbalanced banking-risk pattern:
+ # amount, velocity, merchant risk, distance, and unusual hours contribute
+ # independently. The ~4% base rate keeps the holdout large enough for a
+ # meaningful recall gate without making classification trivial.
  rng=np.random.default_rng(seed)
  amount=rng.lognormal(3.5+shift,1.2,n).clip(0,100000)
  hour=rng.integers(0,24,n);velocity=rng.poisson(2+shift,n).clip(0,1000)
  risk=rng.beta(2+shift,6,n);distance=rng.exponential(45+shift*70,n)
  X=np.column_stack([amount,hour,velocity,risk,distance])
- z=-6.2+0.000015*amount+0.13*velocity+4.2*risk+0.002*distance+0.6*(hour<5)
+ z=-5.4+0.000018*amount+0.18*velocity+5.0*risk+0.0025*distance+0.8*(hour<5)
  p=1/(1+np.exp(-z));y=(rng.random(n)<p).astype(int)
  return X,y
 
