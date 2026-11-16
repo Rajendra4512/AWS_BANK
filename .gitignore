@@ -42,3 +42,28 @@ secrets.json
 .DS_Store
 Thumbs.db
 .vscode/
+
+# AWS_BANK Terraform security
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/terraform.tfvars
+**/terraform.tfvars.*
+**/*.tfvars.bak*
+**/*.tfvars.backup*
+**/*.tf.bak
+**/*.tf.pre-*.bak
+**/crash.log
+**/crash.*.log
+
+# Generated deployment evidence
+deployment_logs/
+aws_deployment_logs/
+aws_s3_integration_logs/
+wheel-verification/
+
+# Local environment files
+.env
+.env.*
+!.env.example

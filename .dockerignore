@@ -6,3 +6,16 @@ __pycache__
 data
 artifacts
 logs
+infra/
+.github/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.pem
+*.key
+*.p12
+*.pfx
+Dockerfile.backup
+**/__pycache__/
+**/.pytest_cache/
+**/*.log
