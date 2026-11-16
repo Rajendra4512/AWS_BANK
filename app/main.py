@@ -255,17 +255,83 @@ def train(u=Depends(admin)):
 @app.get('/api/models')
 def models(u=Depends(principal)):
  with db() as c:return [{**dict(x),'metrics':json.loads(x['metrics'])} for x in c.execute('SELECT * FROM models ORDER BY version DESC')]
+
+def _promotion_evidence(c, version, created):
+ rows=c.execute('SELECT ts,results FROM evaluations ORDER BY id DESC').fetchall()
+ config={r['key']:float(r['value']) for r in c.execute("SELECT key,value FROM domain_config WHERE key IN ('eval_min_recall','eval_max_fpr')")}
+ for row in rows:
+  try: result=json.loads(row['results']);ml=result.get('ml_model_eval') or {};gate=ml.get('quality_gate') or {}
+  except (TypeError,ValueError): continue
+  if ml.get('model_version')!=version: continue
+  if row['ts']<created: return False,'evaluation is stale'
+  if ml.get('status')!='completed': return False,'evaluation is incomplete'
+  if gate.get('min_recall')!=config.get('eval_min_recall') or gate.get('max_false_positive_rate')!=config.get('eval_max_fpr'):
+   return False,'evaluation thresholds are stale'
+  if gate.get('passed') is not True: return False,'evaluation quality gate failed'
+  return True,''
+ return False,'no completed evaluation exists for this model version'
+
+def _reject_model_action(actor,action,version,reason):
+ audit(actor,action,{'version':version,'reason':reason})
+
+def _reject_model_action_in_transaction(c,actor,action,version,reason):
+ c.execute('INSERT INTO audit(ts,actor,action,detail) VALUES(?,?,?,?)',(now(),actor,action,json.dumps({'version':version,'reason':reason})))
+
 @app.post('/api/admin/models/{version}/promote')
 def promote(version:int,u=Depends(admin)):
- if not ArtifactStore(ART).exists(version):raise HTTPException(404,'Artifact missing')
+ try: artifact_ok=ArtifactStore(ART).exists(version)
+ except Exception:
+  _reject_model_action(u['username'],'model.promotion_rejected',version,'artifact integrity verification failed')
+  raise HTTPException(409,'Promotion blocked: artifact integrity verification failed')
+ if not artifact_ok:
+  _reject_model_action(u['username'],'model.promotion_rejected',version,'artifact missing or unverified')
+  raise HTTPException(409,'Promotion blocked: artifact missing or unverified')
+ rejection=None
  with db() as c:
-  if not c.execute('SELECT 1 FROM models WHERE version=?',(version,)).fetchone():raise HTTPException(404,'Version missing')
-  for row in c.execute('SELECT results FROM evaluations ORDER BY id DESC LIMIT 50'):
-   result=json.loads(row['results']);ml=result.get('ml_model_eval') or {};gate=ml.get('quality_gate') or {}
-   if ml.get('model_version')==version and ml.get('status')=='completed' and gate.get('passed') is False:raise HTTPException(409,'Promotion blocked by the latest failed evaluation quality gate')
-  c.execute("UPDATE models SET status='archived' WHERE status='active'")
-  c.execute("UPDATE models SET status='active' WHERE version=?",(version,))
- audit(u['username'],'model.promote_or_rollback',{'version':version});return {'active_version':version}
+  row=c.execute('SELECT version,created,status FROM models WHERE version=?',(version,)).fetchone()
+  if not row: rejection=(404,'model version is missing','Version missing')
+  elif row['status']!='candidate': rejection=(409,'model is not a candidate','Promotion requires a candidate model')
+  else:
+   approved,reason=_promotion_evidence(c,version,row['created'])
+   if not approved: rejection=(409,reason,'Promotion blocked: '+reason)
+  if rejection is None:
+   c.execute("UPDATE models SET status='archived' WHERE status='active'")
+   c.execute("UPDATE models SET status='active' WHERE version=?",(version,))
+ if rejection:
+  code,reason,message=rejection
+  _reject_model_action(u['username'],'model.promotion_rejected',version,reason)
+  raise HTTPException(code,message)
+ audit(u['username'],'model.promote',{'version':version,'approval':'evaluation_quality_gate'})
+ return {'active_version':version}
+
+@app.post('/api/admin/models/{version}/rollback')
+def rollback(version:int,u=Depends(admin)):
+ try: artifact_ok=ArtifactStore(ART).exists(version)
+ except Exception:
+  _reject_model_action(u['username'],'model.rollback_rejected',version,'artifact integrity verification failed')
+  raise HTTPException(409,'Rollback blocked: artifact integrity verification failed')
+ if not artifact_ok:
+  _reject_model_action(u['username'],'model.rollback_rejected',version,'artifact missing or unverified')
+  raise HTTPException(409,'Rollback blocked: artifact missing or unverified')
+ rejection=None;previous=None
+ with db() as c:
+  row=c.execute('SELECT version,status FROM models WHERE version=?',(version,)).fetchone()
+  if not row: rejection=(404,'model version is missing','Version missing')
+  elif row['status'] not in ('active','archived'): rejection=(409,'model was never approved','Rollback requires a previously approved model')
+  else:
+   approval=c.execute("SELECT 1 FROM audit WHERE action='model.promote' AND json_extract(detail,'$.version')=? ORDER BY id DESC LIMIT 1",(version,)).fetchone()
+   if not approval: rejection=(409,'approval history is unavailable','Rollback requires verifiable prior approval')
+  if rejection is None:
+   active=c.execute("SELECT version FROM models WHERE status='active'").fetchone()
+   previous=active['version'] if active else None
+   c.execute("UPDATE models SET status='archived' WHERE status='active'")
+   c.execute("UPDATE models SET status='active' WHERE version=?",(version,))
+ if rejection:
+  code,reason,message=rejection
+  _reject_model_action(u['username'],'model.rollback_rejected',version,reason)
+  raise HTTPException(code,message)
+ audit(u['username'],'model.rollback',{'version':version,'previous_version':previous,'approval':'historical_model.promote'})
+ return {'active_version':version,'previous_version':previous}
 @app.post('/api/score')
 def score(x:Tx,u=Depends(principal)):
  with db() as c:r=c.execute("SELECT version FROM models WHERE status='active'").fetchone()

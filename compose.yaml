@@ -7,6 +7,11 @@ services:
     environment:
       AWS_BANK_DATA_DIR: /srv/data
       AWS_BANK_ARTIFACT_DIR: /srv/artifacts
+      AWS_BANK_ARTIFACT_BACKEND: ${AWS_BANK_ARTIFACT_BACKEND:-local}
+      AWS_BANK_S3_BUCKET: ${AWS_BANK_S3_BUCKET:-}
+      AWS_BANK_S3_PREFIX: ${AWS_BANK_S3_PREFIX:-models}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
       AWS_BANK_BOOTSTRAP_ADMIN: ${AWS_BANK_BOOTSTRAP_ADMIN:-admin}
       AWS_BANK_BOOTSTRAP_PASSWORD: ${AWS_BANK_BOOTSTRAP_PASSWORD:?Set bootstrap password in .env}
       AWS_BANK_SESSION_SECRET: ${AWS_BANK_SESSION_SECRET:?Set session secret in .env}
