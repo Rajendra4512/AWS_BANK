@@ -1,0 +1,338 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+exec > >(logger -t aws-bank-bootstrap) 2>&1
+
+REGION='${aws_region}'
+IMAGE_URI='${image_uri}'
+DATA_VOLUME_ID='${data_volume_id}'
+MOUNT=/srv/aws-bank-data
+ENV_FILE="$MOUNT/runtime.env"
+
+die() {
+  echo "aws-bank bootstrap failed: $1" >&2
+  exit 1
+}
+
+[[ -n "$IMAGE_URI" ]] || die "image_uri is empty"
+[[ "$IMAGE_URI" == *@sha256:* || "$IMAGE_URI" =~ :[0-9a-fA-F]{40,64}$ ]] || die "image_uri is not immutable"
+[[ -n "$DATA_VOLUME_ID" ]] || die "Terraform did not provide the data volume identity"
+command -v aws >/dev/null 2>&1 || die "AWS CLI v2 is unavailable"
+
+dnf install -y docker
+systemctl enable --now docker
+MOUNT=/srv/aws-bank-data
+mkdir -p "$MOUNT"
+for attempt in {1..30}; do
+  systemctl is-active --quiet docker && break
+  sleep 2
+done
+systemctl is-active --quiet docker || die "Docker daemon did not become ready"
+
+VOLUME_SUFFIX="$${DATA_VOLUME_ID#vol}"
+VOLUME_WAIT_ATTEMPTS=60
+VOLUME_WAIT_SECONDS=2
+
+resolve_data_volume() {
+  DEVICE_LINKS=()
+  mapfile -t DEVICE_LINKS < <(find /dev/disk/by-id -maxdepth 1 -type l -name "*$${VOLUME_SUFFIX}*" -print 2>/dev/null)
+  if [[ $${#DEVICE_LINKS[@]} -ne 1 ]]; then
+    DEVICE_LINKS=()
+    for candidate in /dev/nvme*n1 /dev/xvd*; do
+      [[ -b "$candidate" ]] || continue
+      serial=$(udevadm info --query=property --name="$candidate" 2>/dev/null | awk -F= '$1 == "ID_SERIAL" {print $2}')
+      [[ "$serial" == *"$VOLUME_SUFFIX"* ]] && DEVICE_LINKS+=("$candidate")
+    done
+  fi
+  [[ $${#DEVICE_LINKS[@]} -eq 1 ]]
+}
+
+for ((attempt=1; attempt<=VOLUME_WAIT_ATTEMPTS; attempt++)); do
+  if resolve_data_volume; then
+    break
+  fi
+  if (( attempt == VOLUME_WAIT_ATTEMPTS )); then
+    die "expected EBS volume $DATA_VOLUME_ID did not appear as exactly one device after $((VOLUME_WAIT_ATTEMPTS * VOLUME_WAIT_SECONDS)) seconds"
+  fi
+  sleep "$VOLUME_WAIT_SECONDS"
+done
+[[ $${#DEVICE_LINKS[@]} -eq 1 ]] || die "intended EBS volume did not resolve to exactly one device"
+DEVICE=$(readlink -f "$${DEVICE_LINKS[0]}")
+[[ -b "$DEVICE" ]] || die "resolved EBS device is not a block device"
+mapfile -t BLOCK_TYPES < <(lsblk -nr -o TYPE "$DEVICE")
+[[ $${#BLOCK_TYPES[@]} -eq 1 && "$${BLOCK_TYPES[0]}" == "disk" ]] || die "data device has unexpected partitions or ambiguity"
+
+if FS_TYPE=$(blkid -s TYPE -o value "$DEVICE" 2>/dev/null); then
+  [[ "$FS_TYPE" == "xfs" ]] || die "existing filesystem is not xfs; refusing reformat"
+else
+  if ! command -v mkfs.xfs >/dev/null 2>&1; then
+    dnf install -y xfsprogs || die "xfsprogs installation failed"
+  fi
+  command -v mkfs.xfs >/dev/null 2>&1 || die "mkfs.xfs is unavailable after xfsprogs installation"
+  mkfs.xfs -f "$DEVICE" || die "new data volume formatting failed"
+fi
+UUID=$(blkid -s UUID -o value "$DEVICE") || die "data volume UUID could not be read"
+[[ -n "$UUID" ]] || die "data volume UUID is empty"
+FSTAB_LINE="UUID=$UUID $MOUNT xfs defaults,nofail,x-systemd.device-timeout=30s 0 2"
+grep -Fqx "$FSTAB_LINE" /etc/fstab || echo "$FSTAB_LINE" >> /etc/fstab
+if mountpoint -q "$MOUNT"; then
+  MOUNT_SOURCE=$(findmnt -n -o SOURCE --target "$MOUNT") || die "mounted source could not be read"
+  [[ "$(readlink -f "$MOUNT_SOURCE")" == "$DEVICE" ]] || die "mountpoint uses the wrong device"
+else
+  mount "$DEVICE" "$MOUNT" || die "intended data volume mount failed"
+fi
+mountpoint -q "$MOUNT" || die "data volume is not mounted"
+MOUNT_SOURCE=$(findmnt -n -o SOURCE --target "$MOUNT") || die "mounted source verification failed"
+[[ "$(readlink -f "$MOUNT_SOURCE")" == "$DEVICE" ]] || die "mounted source mismatch"
+mkdir -p "$MOUNT/data" "$MOUNT/artifacts"
+chown -R 10001:10001 "$MOUNT/data" "$MOUNT/artifacts"
+
+BOOTSTRAP_PASSWORD=$(aws ssm get-parameter --name '${bootstrap_password_parameter}' --with-decryption --query Parameter.Value --output text --region "$REGION") || die "bootstrap password parameter could not be read"
+SESSION_SECRET=$(aws ssm get-parameter --name '${session_secret_parameter}' --with-decryption --query Parameter.Value --output text --region "$REGION") || die "session secret parameter could not be read"
+[[ $${#BOOTSTRAP_PASSWORD} -ge 12 ]] || die "bootstrap password parameter is missing or too short"
+[[ $${#SESSION_SECRET} -ge 32 ]] || die "session secret parameter is missing or too short"
+umask 077
+cat > "$ENV_FILE" <<EOF
+AWS_BANK_DATA_DIR=/srv/data
+AWS_BANK_ARTIFACT_DIR=/srv/artifacts
+AWS_BANK_ARTIFACT_BACKEND=s3
+AWS_BANK_S3_BUCKET=${bucket_name}
+AWS_BANK_S3_PREFIX=${artifact_prefix}
+AWS_REGION=$REGION
+AWS_BANK_BOOTSTRAP_ADMIN=admin
+AWS_BANK_BOOTSTRAP_PASSWORD=$${BOOTSTRAP_PASSWORD}
+AWS_BANK_SESSION_SECRET=$${SESSION_SECRET}
+AWS_BANK_SECURE_COOKIE=true
+EOF
+unset BOOTSTRAP_PASSWORD SESSION_SECRET
+chown root:root "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$(echo "$IMAGE_URI" | cut -d/ -f1)" || die "ECR authentication failed"
+docker pull "$IMAGE_URI" || die "immutable application image pull failed"
+docker image inspect "$IMAGE_URI" >/dev/null || die "pulled application image cannot be inspected"
+IMAGE_FILE="$MOUNT/image-uri"
+install -d -m 0755 /run/lock
+exec 9>/run/lock/aws-bank-deploy.lock
+flock -n 9 || { echo "another deployment or startup is in progress" >&2; exit 75; }
+printf '%s\n' "$IMAGE_URI" > "$IMAGE_FILE"
+chmod 600 "$IMAGE_FILE"
+
+cat > /usr/local/sbin/aws-bank-container-run <<'RUN_SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+CONTAINER_NAME="$${1:-}"
+IMAGE_URI="$${2:-}"
+MOUNT=/srv/aws-bank-data
+ENV_FILE="$MOUNT/runtime.env"
+[[ -n "$CONTAINER_NAME" && -n "$IMAGE_URI" ]] || exit 64
+docker run -d --name "$CONTAINER_NAME" --restart=no \
+  --read-only --tmpfs /tmp:size=64m --memory=1g --cpus=1.5 --pids-limit=128 \
+  --security-opt no-new-privileges:true --cap-drop=ALL \
+  -p 127.0.0.1:7005:7005 \
+  --health-cmd='python -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:7005/api/health\", timeout=2)"' \
+  --health-interval=10s --health-timeout=3s --health-retries=6 --health-start-period=15s \
+  --log-driver=awslogs --log-opt awslogs-region='${aws_region}' --log-opt awslogs-group='${log_group_name}' --log-opt awslogs-stream=app \
+  --env-file "$ENV_FILE" \
+  -v "$MOUNT/data:/srv/data" -v "$MOUNT/artifacts:/srv/artifacts" \
+  "$IMAGE_URI"
+RUN_SCRIPT
+chmod 700 /usr/local/sbin/aws-bank-container-run
+
+cat > /usr/local/sbin/aws-bank-wait-healthy <<'HEALTH_SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+CONTAINER_NAME="$${1:-}"
+[[ -n "$CONTAINER_NAME" ]] || exit 64
+for attempt in {1..30}; do
+  status=$(docker inspect --format '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null || true)
+  [[ "$status" == "healthy" ]] && exit 0
+  if [[ "$status" == "unhealthy" || "$status" == "exited" || "$status" == "dead" ]]; then
+    echo "container $CONTAINER_NAME failed health check with status $status" >&2
+    exit 1
+  fi
+  sleep 2
+done
+echo "container $CONTAINER_NAME health check timed out" >&2
+exit 1
+HEALTH_SCRIPT
+chmod 700 /usr/local/sbin/aws-bank-wait-healthy
+
+cat > /usr/local/sbin/aws-bank-start <<'START_SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+MOUNT=/srv/aws-bank-data
+ENV_FILE="$MOUNT/runtime.env"
+IMAGE_FILE="$MOUNT/image-uri"
+install -d -m 0755 /run/lock
+exec 9>/run/lock/aws-bank-deploy.lock
+flock -n 9 || { echo "another deployment or startup is in progress" >&2; exit 75; }
+if ! mountpoint -q "$MOUNT"; then
+  echo "persistent data volume is not mounted" >&2
+  exit 1
+fi
+[[ -r "$ENV_FILE" ]] || { echo "runtime secrets file is missing" >&2; exit 1; }
+[[ -r "$IMAGE_FILE" ]] || { echo "image reference file is missing" >&2; exit 1; }
+IMAGE_URI=$(tr -d '\r\n' < "$IMAGE_FILE")
+[[ "$IMAGE_URI" == *@sha256:* || "$IMAGE_URI" =~ :[0-9a-fA-F]{40,64}$ ]] || { echo "image reference is not immutable" >&2; exit 1; }
+docker image inspect "$IMAGE_URI" >/dev/null || { echo "immutable image is unavailable" >&2; exit 1; }
+docker rm -f aws-bank-app 2>/dev/null || true
+/usr/local/sbin/aws-bank-container-run aws-bank-app "$IMAGE_URI" || exit 1
+/usr/local/sbin/aws-bank-wait-healthy aws-bank-app || { docker rm -f aws-bank-app 2>/dev/null || true; exit 1; }
+exit 0
+START_SCRIPT
+chmod 700 /usr/local/sbin/aws-bank-start
+
+cat > /usr/local/sbin/aws-bank-deploy <<'DEPLOY_SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+MOUNT=/srv/aws-bank-data
+IMAGE_FILE="$MOUNT/image-uri"
+PREVIOUS_FILE="$MOUNT/image-uri.previous"
+REGION='${aws_region}'
+install -d -m 0755 /run/lock
+exec 9>/run/lock/aws-bank-deploy.lock
+flock -n 9 || { echo "deployment rejected: another deployment is in progress" >&2; exit 75; }
+
+fail() { echo "aws-bank deployment failed: $1" >&2; exit 1; }
+mountpoint -q "$MOUNT" || fail "persistent data volume is not mounted"
+[[ -r "$MOUNT/runtime.env" ]] || fail "runtime secrets file is missing"
+[[ -r "$IMAGE_FILE" ]] || fail "current image reference is missing"
+
+CURRENT=$(tr -d '\r\n' < "$IMAGE_FILE")
+if [[ "$${1:-}" == "--rollback" ]]; then
+  [[ -r "$PREVIOUS_FILE" ]] || fail "no previous image reference is available"
+  TARGET=$(tr -d '\r\n' < "$PREVIOUS_FILE")
+else
+  [[ "$${1:-}" == "--image-uri" && -n "$${2:-}" ]] || fail "usage: --image-uri IMMUTABLE_URI or --rollback"
+  TARGET="$2"
+fi
+[[ "$TARGET" == *@sha256:* || "$TARGET" =~ :[0-9a-fA-F]{40,64}$ ]] || fail "target image is not immutable"
+
+# Pull and inspect before stopping the known-good container or changing its reference.
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$(echo "$TARGET" | cut -d/ -f1)" || fail "ECR authentication failed"
+docker pull "$TARGET" || fail "target image pull failed"
+docker image inspect "$TARGET" >/dev/null || fail "target image inspection failed"
+
+recover() {
+  docker rm -f aws-bank-app 2>/dev/null || true
+  if /usr/local/sbin/aws-bank-container-run aws-bank-app "$CURRENT" && /usr/local/sbin/aws-bank-wait-healthy aws-bank-app; then
+    echo "deployment failed; rollback to last known-good image succeeded" >&2
+    return 0
+  fi
+  echo "deployment failed; rollback to last known-good image FAILED" >&2
+  return 1
+}
+
+docker rm -f aws-bank-app 2>/dev/null || true
+if ! /usr/local/sbin/aws-bank-container-run aws-bank-app "$TARGET" || ! /usr/local/sbin/aws-bank-wait-healthy aws-bank-app; then
+  if recover; then
+    exit 1
+  else
+    exit 2
+  fi
+fi
+
+if [[ "$TARGET" != "$CURRENT" ]]; then
+  printf '%s\n' "$CURRENT" > "$PREVIOUS_FILE"
+  chmod 600 "$PREVIOUS_FILE"
+  TMP_FILE="$IMAGE_FILE.tmp.$$"
+  printf '%s\n' "$TARGET" > "$TMP_FILE"
+  chmod 600 "$TMP_FILE"
+  mv -f "$TMP_FILE" "$IMAGE_FILE"
+fi
+echo "deployment succeeded; replacement container independently reported healthy" >&2
+exit 0
+DEPLOY_SCRIPT
+chmod 700 /usr/local/sbin/aws-bank-deploy
+
+cat > /usr/local/sbin/aws-bank-auto-shutdown <<'SHUTDOWN_SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+REGION='${aws_region}'
+MAX_RUNTIME_SECONDS=14400
+EXTENSION_FILE=/run/aws-bank-session-extension-seconds
+REQUEST_MARKER=/run/aws-bank-auto-shutdown.requested
+LOCK_FILE=/run/lock/aws-bank-auto-shutdown.lock
+
+install -d -m 0755 /run/lock
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 75
+
+log() { logger -t aws-bank-auto-shutdown -- "$*"; }
+while :; do
+  elapsed=$(cut -d. -f1 /proc/uptime)
+  extension=$(cat "$EXTENSION_FILE" 2>/dev/null || echo 0)
+  [[ "$extension" =~ ^[0-9]+$ ]] || extension=0
+  deadline=$((MAX_RUNTIME_SECONDS + extension))
+  if (( elapsed >= deadline )); then
+    break
+  fi
+  sleep_for=$((deadline - elapsed))
+  (( sleep_for > 60 )) && sleep_for=60
+  sleep "$sleep_for"
+done
+
+[[ ! -e "$REQUEST_MARKER" ]] || exit 0
+touch "$REQUEST_MARKER"
+TOKEN=$(curl --fail --silent --show-error --max-time 5 -X PUT \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token) || { log "IMDSv2 token request failed; instance was not stopped"; exit 1; }
+INSTANCE_ID=$(curl --fail --silent --show-error --max-time 5 \
+  -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id) || { log "instance identity lookup failed; instance was not stopped"; exit 1; }
+[[ "$INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]] || { log "instance identity was invalid; instance was not stopped"; exit 1; }
+log "requesting stop for AWS_BANK instance $INSTANCE_ID after $${deadline}s runtime"
+aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null || { log "EC2 stop request failed for $INSTANCE_ID"; exit 1; }
+log "EC2 stop request accepted for $INSTANCE_ID"
+SHUTDOWN_SCRIPT
+chmod 700 /usr/local/sbin/aws-bank-auto-shutdown
+
+cat > /usr/local/sbin/aws-bank-extend-session <<'EXTEND_SCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+[[ "$EUID" -eq 0 ]] || { echo "session extension requires root" >&2; exit 64; }
+HOURS="$${1:-}"
+[[ "$HOURS" =~ ^[1-9][0-9]*$ && "$HOURS" -le 12 ]] || { echo "usage: aws-bank-extend-session HOURS (1-12)" >&2; exit 64; }
+install -d -m 0755 /run
+printf '%s\n' "$((HOURS * 3600))" > /run/aws-bank-session-extension-seconds
+chmod 600 /run/aws-bank-session-extension-seconds
+logger -t aws-bank-auto-shutdown -- "session extended by $${HOURS} hour(s)"
+EXTEND_SCRIPT
+chmod 700 /usr/local/sbin/aws-bank-extend-session
+
+cat > /etc/systemd/system/aws-bank-auto-shutdown.service <<'UNIT'
+[Unit]
+Description=AWS_BANK four-hour automatic EC2 shutdown
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/aws-bank-auto-shutdown
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/aws-bank-app.service <<'UNIT'
+[Unit]
+Description=AWS_BANK application after persistent data mount
+Requires=docker.service
+After=docker.service local-fs.target
+RequiresMountsFor=/srv/aws-bank-data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/aws-bank-start
+ExecStop=/usr/bin/docker stop -t 15 aws-bank-app
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable aws-bank-auto-shutdown.service
+systemctl start --no-block aws-bank-auto-shutdown.service || die "automatic shutdown service failed to start"
+systemctl enable --now aws-bank-app.service || die "application service failed to become healthy"
