@@ -20,6 +20,8 @@ jobs:
           AWS_BANK_BOOTSTRAP_PASSWORD: ci-only-placeholder-password
           AWS_BANK_SESSION_SECRET: ci-only-placeholder-session-secret
         run: docker compose -p aws_bank config --quiet
+      - name: Prepare offline Linux wheelhouse
+        run: python -m pip download --only-binary=:all: --dest wheels -r requirements.txt
       - name: Build scoped offline image
         env:
           AWS_BANK_BOOTSTRAP_PASSWORD: ci-only-placeholder-password

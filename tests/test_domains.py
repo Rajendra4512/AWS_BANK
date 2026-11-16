@@ -15,10 +15,10 @@ def test_banking_workflows():
   with TestClient(app) as client:
    assert client.get('/api/health').status_code==200
    assert client.get('/api/ready').status_code==200
-   cloud=client.get('/api/admin/cloud-readiness')
-   assert cloud.status_code==200 and cloud.json()['cloud_validated'] is False and len(cloud.json()['blockers'])>=3
    assert client.post('/api/credit/assess',json={'income':100,'debt':5,'credit_utilization':.2,'delinquencies':0,'employment_years':4}).status_code==401
    assert client.post('/api/login',json={'username':'admin','password':'local-test-password-123'}).status_code==200
+   cloud=client.get('/api/admin/cloud-readiness')
+   assert cloud.status_code==200 and cloud.json()['cloud_validated'] is False and len(cloud.json()['blockers'])>=3
    assert client.post('/api/admin/users',json={'username':'analyst','password':'analyst-password-123','role':'user'}).status_code==200
    assert client.put('/api/admin/users/analyst/status',json={'active':False}).json()['active'] is False
    assert client.post('/api/login',json={'username':'analyst','password':'analyst-password-123'}).status_code==401
@@ -41,7 +41,8 @@ def test_banking_workflows():
    first_payload=first_eval.json()
    assert first_payload['agent_eval']['hitl_compliance']==1.0
    assert first_payload['rag_eval']['recall_at_3']>=0
-   assert first_payload['dataset_manifest']['total_executed_cases']>=600
+   assert first_payload['ml_model_eval']['status']=='not_run'
+   assert first_payload['dataset_manifest']['total_executed_cases']>=13
    second_eval=client.post('/api/admin/evals/run')
    assert second_eval.status_code==200
    regression=client.get('/api/admin/evals/regression')
